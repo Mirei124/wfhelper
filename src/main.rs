@@ -1,8 +1,10 @@
+mod audio_inhibit;
 mod mydbus;
 mod mytray;
 mod screen_off;
 use clap::Parser;
 use std::process;
+use std::thread;
 
 #[derive(Parser)]
 #[command(about = "A simple tool")]
@@ -24,5 +26,6 @@ fn main() {
         process::exit(0);
     }
 
+    thread::spawn(|| audio_inhibit::audio_auto_inhibit());
     mytray::create_tray(cli.inhibit);
 }
