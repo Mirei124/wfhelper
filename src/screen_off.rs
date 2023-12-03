@@ -4,6 +4,9 @@ use std::thread::sleep;
 use std::time::Duration;
 use wayland_client::protocol::{wl_output, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1, ext_idle_notifier_v1,
+};
 use wayland_protocols_plasma::idle::client::{org_kde_kwin_idle, org_kde_kwin_idle_timeout};
 use wayland_protocols_wlr::output_power_management::v1::client::zwlr_output_power_manager_v1;
 use wayland_protocols_wlr::output_power_management::v1::client::zwlr_output_power_v1::{
@@ -43,6 +46,7 @@ fn wayland_off(wait_time: u32) {
         seat: None,
         outputs: Vec::new(),
         idle: None,
+        idle_new: None,
         resumed: false,
     };
 
@@ -51,20 +55,39 @@ fn wayland_off(wait_time: u32) {
     if state.manager.is_none() {
         panic!("Current wayland compositor not support zwlr_output_power_manager_v1");
     }
-    if state.idle.is_none() {
-        panic!("Current wayland compositor not support org_kde_kwin_idle");
+
+    if state.idle.is_none() && state.idle_new.is_none() {
+        panic!(
+        "Current wayland compositor supports neither org_kde_kwin_idle nor ext_idle_notifier_v1"
+    );
     }
 
-    let idle_time = state.idle.as_ref().unwrap().get_idle_timeout(
-        state.seat.as_ref().unwrap(),
-        wait_time,
-        &qhandle,
-        (),
-    );
+    let mut idle_time = None;
+    let mut idle_time_new = None;
+    if state.idle.is_some() {
+        idle_time = Some(state.idle.as_ref().unwrap().get_idle_timeout(
+            state.seat.as_ref().unwrap(),
+            wait_time,
+            &qhandle,
+            (),
+        ));
+    } else {
+        idle_time_new = Some(state.idle_new.as_ref().unwrap().get_idle_notification(
+            wait_time,
+            state.seat.as_ref().unwrap(),
+            &qhandle,
+            (),
+        ));
+    }
     while !state.resumed {
         event_queue.blocking_dispatch(&mut state).unwrap();
     }
-    idle_time.release();
+    if idle_time.is_some() {
+        idle_time.unwrap().release();
+    }
+    if idle_time_new.is_some() {
+        idle_time_new.unwrap().destroy();
+    }
     event_queue.roundtrip(&mut state).unwrap();
 }
 
@@ -73,6 +96,7 @@ struct State {
     seat: Option<wl_seat::WlSeat>,
     outputs: Vec<Option<wl_output::WlOutput>>,
     idle: Option<org_kde_kwin_idle::OrgKdeKwinIdle>,
+    idle_new: Option<ext_idle_notifier_v1::ExtIdleNotifierV1>,
     resumed: bool,
 }
 
@@ -139,6 +163,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         proxy.bind::<wl_output::WlOutput, _, _>(name, version, qhandle, ());
                     state.outputs.push(Some(output));
                 }
+                "ext_idle_notifier_v1" => {
+                    let idle = proxy.bind::<ext_idle_notifier_v1::ExtIdleNotifierV1, _, _>(
+                        name,
+                        version,
+                        qhandle,
+                        (),
+                    );
+                    state.idle_new = Some(idle);
+                }
                 _ => {}
             }
         }
@@ -166,6 +199,42 @@ impl Dispatch<org_kde_kwin_idle_timeout::OrgKdeKwinIdleTimeout, ()> for State {
                 unreachable!("{event:?}");
             }
         }
+    }
+}
+
+impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ext_idle_notification_v1::ExtIdleNotificationV1,
+        event: <ext_idle_notification_v1::ExtIdleNotificationV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => {
+                state.set_output_off(qhandle);
+            }
+            ext_idle_notification_v1::Event::Resumed => {
+                state.resumed = true;
+                state.set_output_on(qhandle);
+            }
+            _ => {
+                unreachable!("{event:?}");
+            }
+        }
+    }
+}
+
+impl Dispatch<ext_idle_notifier_v1::ExtIdleNotifierV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ext_idle_notifier_v1::ExtIdleNotifierV1,
+        _event: <ext_idle_notifier_v1::ExtIdleNotifierV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
     }
 }
 
