@@ -2,128 +2,190 @@ use std::env::var;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
-use wayland_client::protocol::{wl_output, wl_registry, wl_seat};
-use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::{
+    delegate_noop,
+    protocol::{wl_output, wl_registry, wl_seat},
+    Connection, Dispatch, QueueHandle,
+};
 use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1, ext_idle_notifier_v1,
 };
-use wayland_protocols_plasma::idle::client::{org_kde_kwin_idle, org_kde_kwin_idle_timeout};
-use wayland_protocols_wlr::output_power_management::v1::client::zwlr_output_power_manager_v1;
-use wayland_protocols_wlr::output_power_management::v1::client::zwlr_output_power_v1::{
-    self, Mode,
+use wayland_protocols_plasma::{
+    dpms::client::{org_kde_kwin_dpms, org_kde_kwin_dpms_manager},
+    idle::client::{org_kde_kwin_idle, org_kde_kwin_idle_timeout},
+};
+use wayland_protocols_wlr::output_power_management::v1::client::{
+    zwlr_output_power_manager_v1, zwlr_output_power_v1,
 };
 
-pub fn do_off(wait_time: Option<u32>) {
+// which creates a notification after inactive for a while
+trait IdleNotifier {
+    fn get_idle_notify(
+        &self,
+        seat: &wl_seat::WlSeat,
+        wait_time: u32,
+        queue_handle: &QueueHandle<State>,
+    ) -> Box<dyn IdleNotification>;
+}
+
+// created by IdleNotifier
+trait IdleNotification {
+    fn destroy_notifier(self: Box<Self>);
+}
+
+trait OutputPowerManager {
+    fn set_output_off(&self, state: &State, qhandle: &QueueHandle<State>);
+    fn set_output_on(&self, state: &State, qhandle: &QueueHandle<State>);
+}
+
+impl IdleNotifier for ext_idle_notifier_v1::ExtIdleNotifierV1 {
+    fn get_idle_notify(
+        &self,
+        seat: &wl_seat::WlSeat,
+        wait_time: u32,
+        queue_handle: &QueueHandle<State>,
+    ) -> Box<dyn IdleNotification> {
+        let notification = self.get_idle_notification(wait_time, seat, queue_handle, ());
+        Box::new(notification)
+    }
+}
+
+impl IdleNotification for ext_idle_notification_v1::ExtIdleNotificationV1 {
+    fn destroy_notifier(self: Box<Self>) {
+        self.destroy();
+    }
+}
+
+impl IdleNotifier for org_kde_kwin_idle::OrgKdeKwinIdle {
+    fn get_idle_notify(
+        &self,
+        seat: &wl_seat::WlSeat,
+        wait_time: u32,
+        queue_handle: &QueueHandle<State>,
+    ) -> Box<dyn IdleNotification> {
+        let notification = self.get_idle_timeout(seat, wait_time, queue_handle, ());
+        Box::new(notification)
+    }
+}
+
+impl IdleNotification for org_kde_kwin_idle_timeout::OrgKdeKwinIdleTimeout {
+    fn destroy_notifier(self: Box<Self>) {
+        self.release();
+    }
+}
+
+impl OutputPowerManager for zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1 {
+    fn set_output_off(&self, state: &State, qhandle: &QueueHandle<State>) {
+        for output in &state.outputs {
+            let output_power = self.get_output_power(output, qhandle, ());
+            output_power.set_mode(zwlr_output_power_v1::Mode::Off);
+            output_power.destroy();
+        }
+    }
+
+    fn set_output_on(&self, state: &State, qhandle: &QueueHandle<State>) {
+        for output in &state.outputs {
+            let output_power = self.get_output_power(output, qhandle, ());
+            output_power.set_mode(zwlr_output_power_v1::Mode::On);
+            output_power.destroy();
+        }
+    }
+}
+
+impl OutputPowerManager for org_kde_kwin_dpms_manager::OrgKdeKwinDpmsManager {
+    fn set_output_off(&self, state: &State, qhandle: &QueueHandle<State>) {
+        for output in &state.outputs {
+            let dpms = self.get(output, qhandle, ());
+            dpms.set(org_kde_kwin_dpms::Mode::Off as u32);
+            dpms.release();
+        }
+    }
+
+    fn set_output_on(&self, state: &State, qhandle: &QueueHandle<State>) {
+        for output in &state.outputs {
+            let dpms = self.get(output, qhandle, ());
+            dpms.set(org_kde_kwin_dpms::Mode::On as u32);
+            dpms.release();
+        }
+    }
+}
+
+struct State {
+    idle_notifier: Option<Box<dyn IdleNotifier>>,
+    seat: Option<wl_seat::WlSeat>,
+    outputs: Vec<wl_output::WlOutput>,
+    manager: Option<Box<dyn OutputPowerManager>>,
+    resumed: bool,
+}
+
+pub fn do_screen_off(wait_time: Option<u32>) {
     // millisec
     let wait_time = wait_time.unwrap_or(500);
     let session_type = var("XDG_SESSION_TYPE").unwrap();
     match &session_type[..] {
-        "wayland" => wayland_off(wait_time),
-        "x11" => {
-            sleep(Duration::from_millis(wait_time as u64));
-            Command::new("xset")
-                .args(["dpms", "force", "standby"])
-                .status()
-                .unwrap();
-        }
+        "wayland" => wayland_screen_off(wait_time),
+        "x11" => x11_screen_off(wait_time as u64),
         _ => {
-            panic!("No match for XDG_SESSION_TYPE: {session_type}");
+            unreachable!("No match for XDG_SESSION_TYPE: {session_type}");
         }
     }
 }
 
-fn wayland_off(wait_time: u32) {
-    let conn = Connection::connect_to_env().unwrap();
+fn x11_screen_off(wait_time: u64) {
+    sleep(Duration::from_millis(wait_time));
+    Command::new("xset")
+        .args(["dpms", "force", "standby"])
+        .status()
+        .unwrap();
+}
 
-    let mut event_queue = conn.new_event_queue();
-    let qhandle = event_queue.handle();
-
-    let display = conn.display();
-    display.get_registry(&qhandle, ());
+fn wayland_screen_off(wait_time: u32) {
+    let connection = Connection::connect_to_env().unwrap();
+    let display = connection.display();
+    let mut event_queue = connection.new_event_queue();
+    let queue_handle = event_queue.handle();
 
     let mut state = State {
-        manager: None,
+        idle_notifier: None,
         seat: None,
         outputs: Vec::new(),
-        idle: None,
-        idle_new: None,
+        manager: None,
         resumed: false,
     };
 
+    display.get_registry(&queue_handle, ());
     event_queue.blocking_dispatch(&mut state).unwrap();
 
+    if state.idle_notifier.is_none() {
+        panic!("Current wayland compositor supports neither ext_idle_notifier_v1 nor org_kde_kwin_idle");
+    }
+
     if state.manager.is_none() {
-        panic!("Current wayland compositor not support zwlr_output_power_manager_v1");
+        panic!("Current wayland compositor supports neither zwlr_output_power_manager_v1 nor org_kde_kwin_dpms_manager");
     }
 
-    if state.idle.is_none() && state.idle_new.is_none() {
-        panic!(
-        "Current wayland compositor supports neither org_kde_kwin_idle nor ext_idle_notifier_v1"
+    // set timeout
+    let notification = state.idle_notifier.as_ref().unwrap().get_idle_notify(
+        state.seat.as_ref().expect("WlSeat is None"),
+        wait_time,
+        &queue_handle,
     );
-    }
 
-    let mut idle_time = None;
-    let mut idle_time_new = None;
-    if state.idle.is_some() {
-        idle_time = Some(state.idle.as_ref().unwrap().get_idle_timeout(
-            state.seat.as_ref().unwrap(),
-            wait_time,
-            &qhandle,
-            (),
-        ));
-    } else {
-        idle_time_new = Some(state.idle_new.as_ref().unwrap().get_idle_notification(
-            wait_time,
-            state.seat.as_ref().unwrap(),
-            &qhandle,
-            (),
-        ));
-    }
     while !state.resumed {
         event_queue.blocking_dispatch(&mut state).unwrap();
     }
-    if idle_time.is_some() {
-        idle_time.unwrap().release();
-    }
-    if idle_time_new.is_some() {
-        idle_time_new.unwrap().destroy();
-    }
+
+    // cancel timeout
+    notification.destroy_notifier();
+
     event_queue.roundtrip(&mut state).unwrap();
-}
-
-struct State {
-    manager: Option<zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1>,
-    seat: Option<wl_seat::WlSeat>,
-    outputs: Vec<Option<wl_output::WlOutput>>,
-    idle: Option<org_kde_kwin_idle::OrgKdeKwinIdle>,
-    idle_new: Option<ext_idle_notifier_v1::ExtIdleNotifierV1>,
-    resumed: bool,
-}
-
-impl State {
-    fn set_output_off(&self, qhandle: &QueueHandle<State>) {
-        let manager = self.manager.as_ref().unwrap();
-        for output in &self.outputs {
-            let output_power = manager.get_output_power(output.as_ref().unwrap(), qhandle, ());
-            output_power.set_mode(Mode::Off);
-            output_power.destroy();
-        }
-    }
-    fn set_output_on(&self, qhandle: &QueueHandle<State>) {
-        let manager = self.manager.as_ref().unwrap();
-        for output in &self.outputs {
-            let output_power = manager.get_output_power(output.as_ref().unwrap(), qhandle, ());
-            output_power.set_mode(Mode::On);
-            output_power.destroy();
-        }
-    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
         state: &mut Self,
         proxy: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
+        event: <wl_registry::WlRegistry as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         qhandle: &QueueHandle<Self>,
@@ -135,6 +197,24 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         } = event
         {
             match &interface[..] {
+                "wl_output" => {
+                    let output =
+                        proxy.bind::<wl_output::WlOutput, _, _>(name, version, qhandle, ());
+                    state.outputs.push(output);
+                }
+                "wl_seat" => {
+                    let seat = proxy.bind::<wl_seat::WlSeat, _, _>(name, version, qhandle, ());
+                    state.seat = Some(seat);
+                }
+                "ext_idle_notifier_v1" => {
+                    let notifier = proxy.bind::<ext_idle_notifier_v1::ExtIdleNotifierV1, _, _>(
+                        name,
+                        version,
+                        qhandle,
+                        (),
+                    );
+                    state.idle_notifier = Some(Box::new(notifier));
+                }
                 "zwlr_output_power_manager_v1" => {
                     let manager = proxy
                         .bind::<zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1, _, _>(
@@ -143,60 +223,28 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                             qhandle,
                             (),
                         );
-                    state.manager = Some(manager);
-                }
-                "wl_seat" => {
-                    let seat = proxy.bind::<wl_seat::WlSeat, _, _>(name, version, qhandle, ());
-                    state.seat = Some(seat);
+                    state.manager = Some(Box::new(manager));
                 }
                 "org_kde_kwin_idle" => {
-                    let idle = proxy.bind::<org_kde_kwin_idle::OrgKdeKwinIdle, _, _>(
+                    let notifier = proxy.bind::<org_kde_kwin_idle::OrgKdeKwinIdle, _, _>(
                         name,
                         version,
                         qhandle,
                         (),
                     );
-                    state.idle = Some(idle);
+                    state.idle_notifier = Some(Box::new(notifier));
                 }
-                "wl_output" => {
-                    let output =
-                        proxy.bind::<wl_output::WlOutput, _, _>(name, version, qhandle, ());
-                    state.outputs.push(Some(output));
-                }
-                "ext_idle_notifier_v1" => {
-                    let idle = proxy.bind::<ext_idle_notifier_v1::ExtIdleNotifierV1, _, _>(
-                        name,
-                        version,
-                        qhandle,
-                        (),
-                    );
-                    state.idle_new = Some(idle);
+                "org_kde_kwin_dpms_manager" => {
+                    let manager = proxy
+                        .bind::<org_kde_kwin_dpms_manager::OrgKdeKwinDpmsManager, _, _>(
+                            name,
+                            version,
+                            qhandle,
+                            (),
+                        );
+                    state.manager = Some(Box::new(manager));
                 }
                 _ => {}
-            }
-        }
-    }
-}
-
-impl Dispatch<org_kde_kwin_idle_timeout::OrgKdeKwinIdleTimeout, ()> for State {
-    fn event(
-        state: &mut Self,
-        _proxy: &org_kde_kwin_idle_timeout::OrgKdeKwinIdleTimeout,
-        event: <org_kde_kwin_idle_timeout::OrgKdeKwinIdleTimeout as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        qhandle: &QueueHandle<Self>,
-    ) {
-        match event {
-            org_kde_kwin_idle_timeout::Event::Idle => {
-                state.set_output_off(qhandle);
-            }
-            org_kde_kwin_idle_timeout::Event::Resumed => {
-                state.resumed = true;
-                state.set_output_on(qhandle);
-            }
-            _ => {
-                unreachable!("{event:?}");
             }
         }
     }
@@ -206,18 +254,26 @@ impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for State {
     fn event(
         state: &mut Self,
         _proxy: &ext_idle_notification_v1::ExtIdleNotificationV1,
-        event: <ext_idle_notification_v1::ExtIdleNotificationV1 as Proxy>::Event,
+        event: <ext_idle_notification_v1::ExtIdleNotificationV1 as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         qhandle: &QueueHandle<Self>,
     ) {
         match event {
             ext_idle_notification_v1::Event::Idled => {
-                state.set_output_off(qhandle);
+                state
+                    .manager
+                    .as_ref()
+                    .unwrap()
+                    .set_output_off(state, qhandle);
             }
             ext_idle_notification_v1::Event::Resumed => {
+                state
+                    .manager
+                    .as_ref()
+                    .unwrap()
+                    .set_output_on(state, qhandle);
                 state.resumed = true;
-                state.set_output_on(qhandle);
             }
             _ => {
                 unreachable!("{event:?}");
@@ -226,73 +282,43 @@ impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for State {
     }
 }
 
-impl Dispatch<ext_idle_notifier_v1::ExtIdleNotifierV1, ()> for State {
+impl Dispatch<org_kde_kwin_idle_timeout::OrgKdeKwinIdleTimeout, ()> for State {
     fn event(
-        _state: &mut Self,
-        _proxy: &ext_idle_notifier_v1::ExtIdleNotifierV1,
-        _event: <ext_idle_notifier_v1::ExtIdleNotifierV1 as Proxy>::Event,
+        state: &mut Self,
+        _proxy: &org_kde_kwin_idle_timeout::OrgKdeKwinIdleTimeout,
+        event: <org_kde_kwin_idle_timeout::OrgKdeKwinIdleTimeout as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
+        qhandle: &QueueHandle<Self>,
     ) {
+        match event {
+            org_kde_kwin_idle_timeout::Event::Idle => {
+                state
+                    .manager
+                    .as_ref()
+                    .unwrap()
+                    .set_output_off(state, qhandle);
+            }
+            org_kde_kwin_idle_timeout::Event::Resumed => {
+                state
+                    .manager
+                    .as_ref()
+                    .unwrap()
+                    .set_output_on(state, qhandle);
+                state.resumed = true;
+            }
+            _ => {
+                unreachable!("{event:?}");
+            }
+        }
     }
 }
 
-impl Dispatch<wl_output::WlOutput, ()> for State {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wl_output::WlOutput,
-        _event: <wl_output::WlOutput as wayland_client::Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_seat::WlSeat, ()> for State {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wl_seat::WlSeat,
-        _event: <wl_seat::WlSeat as wayland_client::Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1, ()> for State {
-    fn event(
-        _state: &mut Self,
-        _proxy: &zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
-        _event: <zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1 as wayland_client::Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<org_kde_kwin_idle::OrgKdeKwinIdle, ()> for State {
-    fn event(
-        _state: &mut Self,
-        _proxy: &org_kde_kwin_idle::OrgKdeKwinIdle,
-        _event: <org_kde_kwin_idle::OrgKdeKwinIdle as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-    }
-}
-impl Dispatch<zwlr_output_power_v1::ZwlrOutputPowerV1, ()> for State {
-    fn event(
-        _state: &mut Self,
-        _proxy: &zwlr_output_power_v1::ZwlrOutputPowerV1,
-        _event: <zwlr_output_power_v1::ZwlrOutputPowerV1 as Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-    }
-}
+delegate_noop!(State: ignore wl_seat::WlSeat);
+delegate_noop!(State: ignore wl_output::WlOutput);
+delegate_noop!(State: ignore ext_idle_notifier_v1::ExtIdleNotifierV1);
+delegate_noop!(State: ignore zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1);
+delegate_noop!(State: ignore zwlr_output_power_v1::ZwlrOutputPowerV1);
+delegate_noop!(State: ignore org_kde_kwin_idle::OrgKdeKwinIdle);
+delegate_noop!(State: ignore org_kde_kwin_dpms_manager::OrgKdeKwinDpmsManager);
+delegate_noop!(State: ignore org_kde_kwin_dpms::OrgKdeKwinDpms);

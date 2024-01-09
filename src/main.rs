@@ -2,6 +2,7 @@ mod audio_inhibit;
 mod mydbus;
 mod mytray;
 mod screen_off;
+
 use clap::Parser;
 use std::process;
 use std::thread;
@@ -22,7 +23,7 @@ fn main() {
     let cli = Cli::parse();
 
     if cli.screen_off {
-        screen_off::do_off(None);
+        screen_off::do_screen_off(None);
         process::exit(0);
     }
 
