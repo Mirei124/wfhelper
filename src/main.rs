@@ -1,4 +1,5 @@
 mod audio_inhibit;
+mod break_reminder;
 mod mydbus;
 mod mytray;
 mod screen_off;
@@ -17,6 +18,10 @@ struct Cli {
     /// turn off screen
     #[arg(short, long)]
     screen_off: bool,
+
+    /// enable break reminder
+    #[arg(short, long)]
+    break_reminder: bool,
 }
 
 fn main() {
@@ -25,6 +30,10 @@ fn main() {
     if cli.screen_off {
         screen_off::do_screen_off(None);
         process::exit(0);
+    }
+
+    if cli.break_reminder {
+        thread::spawn(|| break_reminder::break_reminder());
     }
 
     thread::spawn(|| audio_inhibit::audio_auto_inhibit());
