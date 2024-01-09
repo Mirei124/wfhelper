@@ -1,21 +1,18 @@
-use crate::mydbus::Cookies;
+use crate::mydbus::PMCookies;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
 pub fn audio_auto_inhibit() {
-    let mut cookie = Cookies::new().unwrap();
-    let mut audio_inhibit = false;
+    let mut audio_cookies = PMCookies::new().unwrap();
     loop {
         if get_audio_play_status() {
-            if !audio_inhibit {
-                cookie.add_inhibit("wfhelper", "audio playing");
-                audio_inhibit = true;
+            if !audio_cookies.get_inhibit_status() {
+                audio_cookies.add_inhibit("wfhelper", "audio playing");
             }
         } else {
-            if audio_inhibit {
-                cookie.rel_inhibit();
-                audio_inhibit = false;
+            if audio_cookies.get_inhibit_status() {
+                audio_cookies.release_inhibit();
             }
         }
         sleep(Duration::from_secs(30));
