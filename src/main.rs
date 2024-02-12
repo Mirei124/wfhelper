@@ -1,5 +1,6 @@
 mod audio_inhibit;
 mod break_reminder;
+mod btrfs_monitor;
 mod mydbus;
 mod mytray;
 mod screen_off;
@@ -22,6 +23,10 @@ struct Cli {
     /// enable break reminder
     #[arg(short, long)]
     break_reminder: bool,
+
+    /// disable btrfs usage monitor
+    #[arg(short = 't', long)]
+    btrfs_monitor: bool,
 }
 
 fn main() {
@@ -37,5 +42,10 @@ fn main() {
     }
 
     thread::spawn(|| audio_inhibit::audio_auto_inhibit());
+
+    if cli.btrfs_monitor {
+        thread::spawn(|| btrfs_monitor::monitor_usage());
+    }
+
     mytray::create_tray(cli.inhibit);
 }
