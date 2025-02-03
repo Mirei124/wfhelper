@@ -12,11 +12,11 @@ use std::thread;
 #[derive(Parser)]
 #[command(about = "A simple tool")]
 struct Cli {
-    /// inhibit dpms
+    /// inhibit dpms at start
     #[arg(short, long)]
     inhibit: bool,
 
-    /// turn off screen
+    /// turn off screen then exit
     #[arg(short, long)]
     screen_off: bool,
 
@@ -24,7 +24,11 @@ struct Cli {
     #[arg(short, long)]
     break_reminder: bool,
 
-    /// disable btrfs usage monitor
+    /// enable inhibit dpms when playing music
+    #[arg(short, long)]
+    audio_inhibit: bool,
+
+    /// enable btrfs usage monitor
     #[arg(short = 't', long)]
     btrfs_monitor: bool,
 }
@@ -41,7 +45,9 @@ fn main() {
         thread::spawn(|| break_reminder::break_reminder());
     }
 
-    thread::spawn(|| audio_inhibit::audio_auto_inhibit());
+    if cli.audio_inhibit {
+        thread::spawn(|| audio_inhibit::audio_auto_inhibit());
+    }
 
     if cli.btrfs_monitor {
         thread::spawn(|| btrfs_monitor::monitor_usage());
